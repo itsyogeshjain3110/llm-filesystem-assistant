@@ -49,6 +49,9 @@ def build_llm() -> LLMConfig:
 def run_assistant(query: str) -> str:
     """Answer a query by calling filesystem tools through an OpenAI-compatible chat model."""
 
+    if _is_direct_resume_read_query(query):
+        return _run_with_rules(query)
+
     if _should_use_rules(query):
         return _run_with_rules(query)
 
@@ -291,11 +294,36 @@ def _run_with_rules(query: str) -> str:
                 return f"Created summary file at {summary_path}\n\n{summary}"
             return result.get("error") or f"Could not read resume file: {target}"
 
+    if read_match:
+        target = _guess_path_from_query(query)
+        target = _resolve_resume_target(target)
+        if not target:
+            target = _find_resume_for_person(_extract_resume_person_name(query) or read_match.group(1))
+        if target:
+            result = read_file(target)
+            if result.get("success"):
+                content = result.get("content", "")
+                preview = " ".join([line.strip() for line in content.splitlines() if line.strip()])[:1200]
+                return f"Resume content for {os.path.basename(target)}:\n\n{preview}"
+            return result.get("error") or f"Could not read resume file: {target}"
+
     if _is_resume_listing_query(lowered):
         folder = _guess_path_from_query(query) or _default_resumes_directory()
         if folder:
             files = list_files(folder)
             resumes = [item for item in files if item.get("extension") in {"pdf", "txt", "docx"}]
+            role = _extract_role_from_query(query)
+            if role:
+                filtered_resumes = []
+                for item in resumes:
+                    result = read_file(item["path"])
+                    if not result.get("success"):
+                        continue
+                    content = result.get("content", "")
+                    if role.lower() in content.lower():
+                        filtered_resumes.append(item)
+                if filtered_resumes:
+                    return json.dumps(filtered_resumes, indent=2, ensure_ascii=False)
             return json.dumps(resumes, indent=2, ensure_ascii=False)
 
     if "python" in lowered and "resume" in lowered:
@@ -318,12 +346,24 @@ def _run_with_rules(query: str) -> str:
             if result.get("success"):
                 return _answer_resume_question(person_name, result.get("content", ""), lowered)
             return result.get("error") or f"Could not read resume file: {resume_path}"
+
+        if "role" in lowered or "job" in lowered or "position" in lowered:
+            fallback_path = _find_resume_for_person_by_partial_match(person_name)
+            if fallback_path:
+                result = read_file(fallback_path)
+                if result.get("success"):
+                    return _answer_resume_question(person_name, result.get("content", ""), lowered)
         return f"I could not find a resume for {person_name}."
 
     return (
         "No API key is configured, so the assistant fell back to rule-based routing. "
         "Set OPENROUTER_API_KEY for OpenRouter, or configure LLM_API_KEY and LLM_BASE_URL for another provider."
     )
+
+
+def _is_direct_resume_read_query(query: str) -> bool:
+    lowered = query.lower().strip()
+    return bool(re.search(r"\b(read|open|inspect)\b", lowered) and "resume" in lowered)
 
 
 def _should_use_rules(query: str) -> bool:
@@ -336,29 +376,54 @@ def _should_use_rules(query: str) -> bool:
             ("summary" in lowered and re.search(r"\.(?:pdf|txt|docx)\b", lowered) is not None),
             ("python" in lowered and "resume" in lowered),
             _extract_resume_person_name(query) is not None,
+            "role" in lowered or "position" in lowered or "job" in lowered,
         ]
     )
 
 
 def _is_resume_listing_query(lowered: str) -> bool:
-    return bool(re.search(r"\blist\b.*\bresumes?\b", lowered) or "read all resumes" in lowered)
+    return bool(
+        re.search(r"\blist\b.*\bresumes?\b", lowered)
+        or "read all resumes" in lowered
+        or re.search(r"\bgive me\b.*\bresumes?\b", lowered)
+        or re.search(r"\bshow me\b.*\bresumes?\b", lowered)
+        or re.search(r"\bfind\b.*\bresumes?\b", lowered)
+    )
+
+
+def _extract_role_from_query(query: str) -> str | None:
+    lowered = query.lower().strip()
+    role_match = re.search(r"\bfor\s+([a-z0-9\s+-]+)\b", lowered)
+    if role_match:
+        role = role_match.group(1).strip()
+        if role and role not in {"resume", "resumes", "file", "files"}:
+            return role
+
+    role_match = re.search(r"\b(?:data analyst|software engineer|product manager|project manager|data scientist|designer|developer)\b", lowered)
+    if role_match:
+        return role_match.group(0)
+
+    return None
 
 
 def _extract_resume_person_name(query: str) -> str | None:
     lowered = query.lower().strip()
-    if not any(keyword in lowered for keyword in ("who is", "tell me", "about", "experience", "resume")):
+    if not any(keyword in lowered for keyword in ("who is", "tell me", "about", "experience", "resume", "role", "position", "job")):
         return None
 
-    match = re.search(
+    patterns = [
         r"(?:who is|tell me about|tell me|about|experience(?: of)?|resume(?: of)?|profile of)\s+(.+)$",
-        query,
-        flags=re.IGNORECASE,
-    )
-    if match:
-        candidate = match.group(1).strip().strip("?.!,")
-        candidate = re.sub(r"\bexperience\b.*$", "", candidate, flags=re.IGNORECASE).strip()
-        if candidate:
-            return candidate
+        r"(?:what is(?: the)?\s+(?:role|position|job)\s+of)\s+(.+)$",
+        r"(?:role|position|job)\s+(?:of|for)\s+(.+)$",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, query, flags=re.IGNORECASE)
+        if match:
+            candidate = match.group(1 if len(match.groups()) == 1 else 2).strip().strip("?.!,")
+            candidate = re.sub(r"\bexperience\b.*$", "", candidate, flags=re.IGNORECASE).strip()
+            if candidate:
+                return candidate
 
     name_like = re.search(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b", query)
     if name_like:
@@ -390,9 +455,35 @@ def _find_resume_for_person(person_name: str) -> str | None:
     return None
 
 
+def _find_resume_for_person_by_partial_match(person_name: str) -> str | None:
+    folder = _default_resumes_directory()
+    person_tokens = [token for token in re.split(r"\s+", person_name.lower()) if token]
+
+    for item in list_files(folder):
+        if item.get("extension") not in {"pdf", "txt", "docx"}:
+            continue
+
+        resolved_path = item["path"]
+        result = read_file(resolved_path)
+        if not result.get("success"):
+            continue
+
+        content = result.get("content", "")
+        lowered_content = content.lower()
+        if all(token in lowered_content for token in person_tokens):
+            return resolved_path
+
+    return None
+
+
 def _answer_resume_question(person_name: str, content: str, lowered_query: str) -> str:
     profile = _extract_section(content, "Profile", ["Education", "Experience", "Key Projects", "Technical Skills", "Certifications", "Achievements"])
     experience = _extract_section(content, "Experience", ["Key Projects", "Technical Skills", "Certifications", "Achievements"])
+
+    if "role" in lowered_query or "position" in lowered_query or "job" in lowered_query:
+        role = _extract_role_from_resume(content)
+        if role:
+            return f"{person_name}'s role appears to be: {role}"
 
     if "experience" in lowered_query:
         answer_parts = [f"{person_name}'s experience:"]
@@ -412,6 +503,15 @@ def _answer_resume_question(person_name: str, content: str, lowered_query: str) 
     else:
         answer_parts.append("I found the resume, but could not isolate a profile section.")
     return "\n\n".join(answer_parts)
+
+
+def _extract_role_from_resume(content: str) -> str | None:
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    for line in lines:
+        lowered = line.lower()
+        if any(token in lowered for token in ["data analyst", "software engineer", "product manager", "project manager", "data scientist", "designer", "developer", "analyst"]):
+            return line.strip()
+    return None
 
 
 def _extract_section(content: str, section_name: str, stop_sections: list[str]) -> str | None:
@@ -446,6 +546,10 @@ def _guess_path_from_query(query: str) -> str | None:
     if folder_match:
         return folder_match.group(1)
 
+    name_match = re.search(r"(?:read|open|inspect)\s+(.+?)(?:\s+resume)?$", query, flags=re.IGNORECASE)
+    if name_match:
+        return name_match.group(1).strip()
+
     return None
 
 
@@ -460,11 +564,24 @@ def _resolve_resume_target(target: str | None) -> str | None:
     if os.path.exists(target):
         return target
 
-    candidate = os.path.join(_default_resumes_directory(), os.path.basename(target))
-    if os.path.exists(candidate):
-        return candidate
+    normalized_target = re.sub(r"\s+", "_", target.strip().lower())
+    candidates = [
+        target,
+        os.path.basename(target),
+        f"{normalized_target}.txt",
+        f"{normalized_target}.pdf",
+        f"{normalized_target}.docx",
+        os.path.join(_default_resumes_directory(), os.path.basename(target)),
+        os.path.join(_default_resumes_directory(), f"{normalized_target}.txt"),
+        os.path.join(_default_resumes_directory(), f"{normalized_target}.pdf"),
+        os.path.join(_default_resumes_directory(), f"{normalized_target}.docx"),
+    ]
 
-    return target
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    return None
 
 
 def _summary_path_for(target: str) -> str:
